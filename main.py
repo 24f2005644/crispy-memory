@@ -18,11 +18,15 @@ How it works, in plain English:
 """
 
 import json
+import logging
 import os
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 import anthropic
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("solver")
 
 app = FastAPI()
 
@@ -58,11 +62,32 @@ class ProblemRequest(BaseModel):
     problem: str
 
 
+def extract_first_json_object(text: str) -> str:
+    """Return just the first balanced {...} block in `text`.
+
+    Claude is instructed to output raw JSON only, but sometimes still
+    adds a trailing sentence, a closing ``` fence, or stray whitespace
+    after the object. A plain json.loads() chokes on that leftover
+    text and throws — which used to burn through all 3 retries and
+    fall back to answer=0. Scanning for the matching closing brace
+    makes parsing robust to that extra text.
+    """
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[: i + 1]
+    raise ValueError(f"No complete JSON object found in model output: {text!r}")
+
+
 def ask_claude(problem_text: str) -> dict:
     """Send the problem to Claude and parse its JSON reply."""
     response = client.messages.create(
         model=MODEL_NAME,
-        max_tokens=1024,
+        max_tokens=2048,  # generous headroom so long reasoning never gets cut off mid-JSON
         system=SYSTEM_PROMPT,
         messages=[
             {"role": "user", "content": problem_text},
@@ -72,7 +97,8 @@ def ask_claude(problem_text: str) -> dict:
         ],
     )
     raw_text = "{" + response.content[0].text
-    return json.loads(raw_text)
+    json_str = extract_first_json_object(raw_text)
+    return json.loads(json_str)
 
 
 def validate(data: dict) -> None:
@@ -94,16 +120,22 @@ def validate(data: dict) -> None:
 @app.post("/solve")
 async def solve(req: ProblemRequest):
     last_error = None
-    for _ in range(3):  # retry up to 3 times if Claude's output breaks a rule
+    for attempt in range(1, 4):  # retry up to 3 times if Claude's output breaks a rule
         try:
             data = ask_claude(req.problem)
             validate(data)
             return data
         except Exception as exc:  # noqa: BLE001 - we want to retry on anything
             last_error = exc
+            logger.warning(
+                "problem_id=%s attempt=%d failed: %s", req.problem_id, attempt, exc
+            )
 
     # Last-resort fallback so the endpoint never crashes or returns
-    # something that fails the grader's shape checks.
+    # something that fails the grader's shape checks. Logged with the
+    # problem_id so you can grep your server logs (e.g. Render's "Logs"
+    # tab) to see exactly what Claude returned and why it was rejected.
+    logger.error("problem_id=%s exhausted retries: %s", req.problem_id, last_error)
     return {
         "reasoning": (
             "The solver could not produce a valid response after multiple "
